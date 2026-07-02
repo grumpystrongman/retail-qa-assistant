@@ -176,7 +176,6 @@ def create_visualization(df):
     
     # Multiple numeric columns: show multiple metrics or charts
     if len(numeric_cols) > 1 and len(categorical_cols) >= 1:
-        # Create subplots for each numeric column
         cat_col = categorical_cols[0]
         
         for num_col in numeric_cols:
@@ -192,12 +191,8 @@ def create_visualization(df):
             st.plotly_chart(fig, use_container_width=True)
         return
     
-    # Default: show data table with highlighting
-    st.dataframe(
-        df.style.background_gradient(cmap='Blues', subset=numeric_cols if numeric_cols else None),
-        use_container_width=True,
-        height=400
-    )
+    # Default: show data table
+    st.dataframe(df, use_container_width=True, height=400)
 
 # Header
 st.markdown("""
@@ -298,15 +293,8 @@ if question:
                         create_visualization(df)
                     
                     with tab2:
-                        # Show styled dataframe
-                        numeric_cols = df.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
-                        if numeric_cols:
-                            st.dataframe(
-                                df.style.background_gradient(cmap='Blues', subset=numeric_cols),
-                                use_container_width=True
-                            )
-                        else:
-                            st.dataframe(df, use_container_width=True)
+                        # Simple dataframe without styling (avoid matplotlib dependency issues)
+                        st.dataframe(df, use_container_width=True)
 
 # Footer
 st.markdown("---")
@@ -324,5 +312,5 @@ st.markdown("""
 * Queries run with your user permissions
 * No data leaves your workspace
 
-**Production Ready** | LLM-Powered | Built with Streamlit + Plotly | v3.0
+**Production Ready** | LLM-Powered | Built with Streamlit + Plotly | v3.1
 """)
