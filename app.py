@@ -1,7 +1,7 @@
 import streamlit as st
 import os
-import json
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 from databricks.sdk.service.sql import StatementState
 
 # Page config
@@ -24,32 +24,18 @@ SCHEMA_CONTEXT = """
 You have access to these tables in databricks_simulated_retail_customer_data.v01:
 
 1. sales table:
-   - customer_id (bigint)
-   - customer_name (string)
-   - product_name (string)
-   - order_date (date)
-   - product_category (string)
-   - product (string)
-   - total_price (bigint)
+   - customer_id (bigint), customer_name (string), product_name (string)
+   - order_date (date), product_category (string), product (string), total_price (bigint)
 
 2. customers table:
-   - customer_id (bigint)
-   - customer_name (string)
-   - state (string)
-   - city (string)
-   - region (string)
-   - district (string)
-   - loyalty_segment (bigint)
-   - units_purchased (bigint)
+   - customer_id (bigint), customer_name (string), state (string), city (string)
+   - region (string), district (string), loyalty_segment (bigint), units_purchased (bigint)
 
 3. sales_orders table:
-   - customer_id (bigint)
-   - customer_name (string)
-   - order_number (string)
-   - order_datetime (timestamp)
-   - number_of_line_items (bigint)
+   - customer_id (bigint), customer_name (string), order_number (string)
+   - order_datetime (timestamp), number_of_line_items (bigint)
 
-Generate ONLY the SQL query, no explanation. Use fully qualified table names like databricks_simulated_retail_customer_data.v01.sales
+Generate ONLY the SQL query, no explanation. Use fully qualified table names.
 """
 
 def validate_question(question):
@@ -66,7 +52,7 @@ def validate_question(question):
     return False, "Please ask about sales, customers, products, or orders"
 
 def generate_sql(question):
-    """Generate SQL using LLM - FIXED to handle response correctly"""
+    """Generate SQL using LLM - FIXED to use ChatMessage objects"""
     try:
         w = get_databricks_client()
         
@@ -76,21 +62,18 @@ User question: {question}
 
 Generate SQL query:"""
         
-        # Call the Foundation Model API
+        # FIX: Use ChatMessage objects instead of dicts!
         response = w.serving_endpoints.query(
             name="databricks-meta-llama-3-3-70b-instruct",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                ChatMessage(role=ChatMessageRole.USER, content=prompt)
+            ],
             temperature=0.1,
             max_tokens=500
         )
         
-        # FIX: Handle response correctly
-        # The response object has a 'choices' attribute, not a dict
-        if hasattr(response, 'choices') and len(response.choices) > 0:
-            sql = response.choices[0].message.content.strip()
-        else:
-            # Fallback: try to access as dict
-            sql = response['choices'][0]['message']['content'].strip()
+        # Extract SQL from response
+        sql = response.choices[0].message.content.strip()
         
         # Extract SQL from markdown code blocks if present
         if "```sql" in sql:
@@ -280,5 +263,5 @@ st.markdown("""
 * Queries run with your user permissions
 * No data leaves your workspace
 
-**Production Ready** | LLM-Powered | Built with Streamlit
+**Production Ready** | LLM-Powered | Built with Streamlit | v2.1
 """)
