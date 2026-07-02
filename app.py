@@ -1,5 +1,8 @@
 import streamlit as st
 import os
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 from databricks.sdk.service.sql import StatementState
@@ -52,7 +55,7 @@ def validate_question(question):
     return False, "Please ask about sales, customers, products, or orders"
 
 def generate_sql(question):
-    """Generate SQL using LLM - FIXED to use ChatMessage objects"""
+    """Generate SQL using LLM"""
     try:
         w = get_databricks_client()
         
@@ -62,26 +65,20 @@ User question: {question}
 
 Generate SQL query:"""
         
-        # FIX: Use ChatMessage objects instead of dicts!
         response = w.serving_endpoints.query(
             name="databricks-meta-llama-3-3-70b-instruct",
-            messages=[
-                ChatMessage(role=ChatMessageRole.USER, content=prompt)
-            ],
+            messages=[ChatMessage(role=ChatMessageRole.USER, content=prompt)],
             temperature=0.1,
             max_tokens=500
         )
         
-        # Extract SQL from response
         sql = response.choices[0].message.content.strip()
         
-        # Extract SQL from markdown code blocks if present
         if "```sql" in sql:
             sql = sql.split("```sql")[1].split("```")[0].strip()
         elif "```" in sql:
             sql = sql.split("```")[1].split("```")[0].strip()
         
-        # Clean up
         sql = sql.strip().rstrip(';')
         
         return sql, None
@@ -93,7 +90,6 @@ def execute_sql(sql):
     try:
         w = get_databricks_client()
         
-        # Execute statement
         statement = w.statement_execution.execute_statement(
             warehouse_id=os.environ.get("DATABRICKS_WAREHOUSE_ID"),
             statement=sql,
@@ -103,7 +99,6 @@ def execute_sql(sql):
         if statement.status.state != StatementState.SUCCEEDED:
             return None, None, f"Query failed: {statement.status.state}"
         
-        # Get results
         if statement.result and statement.result.data_array:
             columns = [col.name for col in statement.manifest.schema.columns]
             rows = statement.result.data_array
@@ -114,6 +109,96 @@ def execute_sql(sql):
     except Exception as e:
         return None, None, f"Execution failed: {str(e)}"
 
+def create_visualization(df):
+    """Create smart visualizations based on data structure"""
+    
+    if df.empty:
+        st.info("No data to visualize")
+        return
+    
+    # Identify numeric and categorical columns
+    numeric_cols = df.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
+    categorical_cols = df.select_dtypes(include=['object', 'string']).columns.tolist()
+    
+    # Single value result
+    if len(df) == 1 and len(numeric_cols) == 1:
+        col1, col2, col3 = st.columns(3)
+        with col2:
+            st.metric(
+                label=numeric_cols[0].replace('_', ' ').title(),
+                value=f"{df[numeric_cols[0]].iloc[0]:,.0f}"
+            )
+        return
+    
+    # Two columns: category + value (simple bar chart)
+    if len(df.columns) == 2 and len(numeric_cols) == 1 and len(categorical_cols) == 1:
+        cat_col = categorical_cols[0]
+        num_col = numeric_cols[0]
+        
+        fig = px.bar(
+            df,
+            x=cat_col,
+            y=num_col,
+            title=f"{num_col.replace('_', ' ').title()} by {cat_col.replace('_', ' ').title()}",
+            color=num_col,
+            color_continuous_scale='Blues'
+        )
+        fig.update_layout(
+            xaxis_title=cat_col.replace('_', ' ').title(),
+            yaxis_title=num_col.replace('_', ' ').title(),
+            showlegend=False,
+            height=500
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        return
+    
+    # Three columns: 2 categorical + 1 numeric (grouped bar chart)
+    if len(df.columns) == 3 and len(numeric_cols) == 1 and len(categorical_cols) == 2:
+        group_col = categorical_cols[0]
+        category_col = categorical_cols[1]
+        value_col = numeric_cols[0]
+        
+        fig = px.bar(
+            df,
+            x=category_col,
+            y=value_col,
+            color=group_col,
+            title=f"{value_col.replace('_', ' ').title()} by {category_col.replace('_', ' ').title()} and {group_col.replace('_', ' ').title()}",
+            barmode='group'
+        )
+        fig.update_layout(
+            xaxis_title=category_col.replace('_', ' ').title(),
+            yaxis_title=value_col.replace('_', ' ').title(),
+            height=500
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        return
+    
+    # Multiple numeric columns: show multiple metrics or charts
+    if len(numeric_cols) > 1 and len(categorical_cols) >= 1:
+        # Create subplots for each numeric column
+        cat_col = categorical_cols[0]
+        
+        for num_col in numeric_cols:
+            fig = px.bar(
+                df,
+                x=cat_col,
+                y=num_col,
+                title=f"{num_col.replace('_', ' ').title()}",
+                color=num_col,
+                color_continuous_scale='Viridis'
+            )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        return
+    
+    # Default: show data table with highlighting
+    st.dataframe(
+        df.style.background_gradient(cmap='Blues', subset=numeric_cols if numeric_cols else None),
+        use_container_width=True,
+        height=400
+    )
+
 # Header
 st.markdown("""
 <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 15px; color: white; margin-bottom: 30px;">
@@ -122,23 +207,12 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Check if credentials are configured
+# Check credentials
 if not os.environ.get("DATABRICKS_HOST") or not os.environ.get("DATABRICKS_TOKEN"):
     st.error("""
     ⚠️ **Databricks credentials not configured**
     
-    This app needs Databricks credentials to query live data. 
-    
-    **For Streamlit Cloud deployment:**
-    1. Go to App Settings → Secrets
-    2. Add these secrets:
-       ```
-       DATABRICKS_HOST = "https://your-workspace.cloud.databricks.com"
-       DATABRICKS_TOKEN = "your-access-token"
-       DATABRICKS_WAREHOUSE_ID = "your-warehouse-id"
-       ```
-    
-    **For now, using DEMO MODE with validation only.**
+    Configure secrets in Streamlit Cloud App Settings to enable live queries!
     """)
     demo_mode = True
 else:
@@ -159,8 +233,8 @@ with st.expander("📝 Example Questions", expanded=False):
         st.markdown("""
         * How many orders per state?
         * What's the average order value?
-        * Show me customer demographics by region
-        * Which products sell best in each state?
+        * Show me top 5 products by state
+        * Which regions generate the most revenue?
         """)
 
 st.markdown("---")
@@ -173,7 +247,7 @@ question = st.text_input(
 )
 
 if question:
-    # Step 1: Validate domain
+    # Validate
     with st.spinner("🔍 Validating question..."):
         is_valid, message = validate_question(question)
     
@@ -185,77 +259,64 @@ if question:
         
         if demo_mode:
             st.info("""
-            **Demo Mode**: Credentials not configured.
-            
-            In production, this would:
-            1. ✅ Generate SQL using LLM (Llama 3.3 70B)
-            2. ✅ Execute query against Unity Catalog
-            3. ✅ Display results with visualizations
-            
-            Configure secrets in Streamlit Cloud to enable live queries!
+            **Demo Mode**: Configure secrets to enable live queries!
             """)
         else:
-            # Step 2: Generate SQL
+            # Generate SQL
             with st.spinner("🤖 Generating SQL with LLM..."):
                 sql, error = generate_sql(question)
             
             if error:
                 st.error(f"❌ {error}")
-                st.info("💡 **Tip**: Try rephrasing your question or use simpler terms.")
             else:
-                st.subheader("Generated SQL:")
-                st.code(sql, language="sql")
+                with st.expander("📄 Generated SQL", expanded=False):
+                    st.code(sql, language="sql")
                 
-                # Step 3: Execute SQL
-                with st.spinner("⚡ Executing query (may take 1-2 min if warehouse is starting)..."):
+                # Execute
+                with st.spinner("⚡ Executing query..."):
                     columns, rows, error = execute_sql(sql)
                 
                 if error:
                     st.error(f"❌ {error}")
-                    st.info("The warehouse may be starting up. Wait 1-2 minutes and try again.")
                 else:
-                    # Step 4: Display results
                     st.success(f"✅ Query returned {len(rows)} rows")
                     
                     # Create dataframe
-                    import pandas as pd
                     df = pd.DataFrame(rows, columns=columns)
                     
-                    # Tabs for different views
+                    # Convert numeric strings to numbers
+                    for col in df.columns:
+                        try:
+                            df[col] = pd.to_numeric(df[col])
+                        except:
+                            pass
+                    
+                    # Tabs
                     tab1, tab2 = st.tabs(["📊 Visualization", "📋 Data Table"])
                     
                     with tab1:
-                        # Auto-detect chart type based on columns
-                        if len(columns) == 2 and len(rows) > 0:
-                            # Bar chart for 2 columns
-                            try:
-                                st.bar_chart(df.set_index(columns[0]))
-                            except:
-                                st.dataframe(df)
-                        elif len(columns) >= 3 and len(rows) > 0:
-                            # Try line chart
-                            try:
-                                st.line_chart(df.set_index(columns[0]))
-                            except:
-                                st.dataframe(df)
-                        elif len(rows) == 1:
-                            # Single value - show as metric
-                            st.metric(columns[0], df[columns[0]][0])
-                        else:
-                            st.dataframe(df, use_container_width=True)
+                        create_visualization(df)
                     
                     with tab2:
-                        st.dataframe(df, use_container_width=True)
+                        # Show styled dataframe
+                        numeric_cols = df.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
+                        if numeric_cols:
+                            st.dataframe(
+                                df.style.background_gradient(cmap='Blues', subset=numeric_cols),
+                                use_container_width=True
+                            )
+                        else:
+                            st.dataframe(df, use_container_width=True)
 
 # Footer
 st.markdown("---")
 st.markdown("""
 ### 🎯 How It Works
 
-1. **Domain Validation** → Keyword matching ensures retail focus
-2. **SQL Generation** → Llama 3.3 70B generates SQL from natural language
-3. **Query Execution** → Runs against Unity Catalog with serverless SQL
-4. **Visualization** → Auto-detects chart type and displays results
+1. **Domain Validation** → Ensures questions are about retail analytics
+2. **SQL Generation** → Llama 3.3 70B converts natural language to SQL
+3. **Query Execution** → Runs against Unity Catalog serverless SQL
+4. **Smart Visualization** → Automatically creates appropriate charts with Plotly
 
 ### 🔐 Security
 
@@ -263,5 +324,5 @@ st.markdown("""
 * Queries run with your user permissions
 * No data leaves your workspace
 
-**Production Ready** | LLM-Powered | Built with Streamlit | v2.1
+**Production Ready** | LLM-Powered | Built with Streamlit + Plotly | v3.0
 """)
