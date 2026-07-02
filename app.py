@@ -3,6 +3,7 @@ import os
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import re
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 from databricks.sdk.service.sql import StatementState
@@ -22,7 +23,7 @@ def get_databricks_client():
         token=os.environ.get("DATABRICKS_TOKEN")
     )
 
-# Database schema context
+# Enhanced schema context with window function examples
 SCHEMA_CONTEXT = """
 You have access to these tables in databricks_simulated_retail_customer_data.v01:
 
@@ -37,6 +38,27 @@ You have access to these tables in databricks_simulated_retail_customer_data.v01
 3. sales_orders table:
    - customer_id (bigint), customer_name (string), order_number (string)
    - order_datetime (timestamp), number_of_line_items (bigint)
+
+IMPORTANT PATTERNS:
+
+When the question asks for "top N by X per Y" or "top N X by state/region/category":
+Use window functions with ROW_NUMBER() and PARTITION BY.
+
+Example: "Top 3 products by revenue per state"
+SELECT state, product_name, total_revenue
+FROM (
+  SELECT 
+    c.state, 
+    s.product_name, 
+    SUM(s.total_price) AS total_revenue,
+    ROW_NUMBER() OVER (PARTITION BY c.state ORDER BY SUM(s.total_price) DESC) as rank
+  FROM databricks_simulated_retail_customer_data.v01.sales s
+  JOIN databricks_simulated_retail_customer_data.v01.customers c ON s.customer_id = c.customer_id
+  GROUP BY c.state, s.product_name
+)
+WHERE rank <= 3
+
+DO NOT use LIMIT at the end for "per X" queries - use window functions instead.
 
 Generate ONLY the SQL query, no explanation. Use fully qualified table names.
 """
@@ -54,8 +76,47 @@ def validate_question(question):
         return True, "Valid retail analytics question"
     return False, "Please ask about sales, customers, products, or orders"
 
+def detect_per_pattern(question):
+    """Detect if question asks for top N per category"""
+    q = question.lower()
+    
+    # Patterns like "top N X by/per Y"
+    patterns = [
+        r'top \d+ .+ (by|per) (state|region|category|customer|product)',
+        r'best .+ (by|per|for each) (state|region|category)',
+        r'.+ (by|per|for each) (state|region|category|customer)'
+    ]
+    
+    for pattern in patterns:
+        if re.search(pattern, q):
+            return True
+    
+    return False
+
+def validate_and_fix_sql(sql, question):
+    """Check if SQL needs window function for 'per X' questions"""
+    needs_window = detect_per_pattern(question)
+    has_limit = 'LIMIT' in sql.upper()
+    has_window = 'ROW_NUMBER()' in sql.upper() or 'RANK()' in sql.upper()
+    
+    if needs_window and has_limit and not has_window:
+        return False, """
+⚠️ **SQL may be incorrect for 'per X' query**
+
+Your question asks for results **per state/region/category**, but the generated SQL uses LIMIT,
+which will only return N rows total, not N rows per category.
+
+**Suggested approach:**
+* Use window functions with `ROW_NUMBER() OVER (PARTITION BY ...)`
+* Remove the `LIMIT` clause
+
+Would you like me to regenerate the SQL with this pattern?
+"""
+    
+    return True, None
+
 def generate_sql(question):
-    """Generate SQL using LLM"""
+    """Generate SQL using LLM with enhanced prompt"""
     try:
         w = get_databricks_client()
         
@@ -164,8 +225,10 @@ def create_visualization(df):
             y=value_col,
             color=group_col,
             title=f"{value_col.replace('_', ' ').title()} by {category_col.replace('_', ' ').title()} and {group_col.replace('_', ' ').title()}",
-            barmode='group'
+            barmode='group',
+            text=value_col
         )
+        fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
         fig.update_layout(
             xaxis_title=category_col.replace('_', ' ').title(),
             yaxis_title=value_col.replace('_', ' ').title(),
@@ -220,7 +283,7 @@ with st.expander("📝 Example Questions", expanded=False):
     with col1:
         st.markdown("""
         * What are the top 3 products by revenue?
-        * Show me sales by region
+        * Show me top 5 products **per state**
         * Which customers have the highest loyalty segment?
         * What's the total revenue by product category?
         """)
@@ -228,8 +291,8 @@ with st.expander("📝 Example Questions", expanded=False):
         st.markdown("""
         * How many orders per state?
         * What's the average order value?
-        * Show me top 5 products by state
-        * Which regions generate the most revenue?
+        * Top 3 products by revenue **per region**
+        * Best selling product **per category**
         """)
 
 st.markdown("---")
@@ -237,7 +300,7 @@ st.markdown("---")
 # Question input
 question = st.text_input(
     "💬 Ask a question about your retail data:",
-    placeholder="e.g., What are the top three products by region?",
+    placeholder="e.g., What are the top three products per state?",
     key="question"
 )
 
@@ -264,8 +327,43 @@ if question:
             if error:
                 st.error(f"❌ {error}")
             else:
-                with st.expander("📄 Generated SQL", expanded=False):
+                # Validate SQL for "per X" patterns
+                is_valid_sql, warning = validate_and_fix_sql(sql, question)
+                
+                with st.expander("📄 Generated SQL", expanded=not is_valid_sql):
                     st.code(sql, language="sql")
+                    
+                    if not is_valid_sql:
+                        st.warning(warning)
+                        if st.button("🔄 Regenerate with window function hint"):
+                            # Add explicit hint to prompt
+                            hint_prompt = f"""
+{SCHEMA_CONTEXT}
+
+User question: {question}
+
+CRITICAL: This question asks for results PER category. You MUST use window functions:
+- Use ROW_NUMBER() OVER (PARTITION BY ...) 
+- DO NOT use LIMIT
+
+Generate SQL query:"""
+                            
+                            response = get_databricks_client().serving_endpoints.query(
+                                name="databricks-meta-llama-3-3-70b-instruct",
+                                messages=[ChatMessage(role=ChatMessageRole.USER, content=hint_prompt)],
+                                temperature=0.1,
+                                max_tokens=500
+                            )
+                            
+                            sql = response.choices[0].message.content.strip()
+                            if "```sql" in sql:
+                                sql = sql.split("```sql")[1].split("```")[0].strip()
+                            elif "```" in sql:
+                                sql = sql.split("```")[1].split("```")[0].strip()
+                            sql = sql.strip().rstrip(';')
+                            
+                            st.code(sql, language="sql")
+                            st.success("✅ Regenerated with window function pattern!")
                 
                 # Execute
                 with st.spinner("⚡ Executing query..."):
@@ -293,7 +391,6 @@ if question:
                         create_visualization(df)
                     
                     with tab2:
-                        # Simple dataframe without styling (avoid matplotlib dependency issues)
                         st.dataframe(df, use_container_width=True)
 
 # Footer
@@ -302,9 +399,16 @@ st.markdown("""
 ### 🎯 How It Works
 
 1. **Domain Validation** → Ensures questions are about retail analytics
-2. **SQL Generation** → Llama 3.3 70B converts natural language to SQL
-3. **Query Execution** → Runs against Unity Catalog serverless SQL
-4. **Smart Visualization** → Automatically creates appropriate charts with Plotly
+2. **SQL Generation** → Llama 3.3 70B converts natural language to SQL with window function support
+3. **Smart Detection** → Detects "per X" patterns and validates SQL correctness
+4. **Query Execution** → Runs against Unity Catalog serverless SQL
+5. **Smart Visualization** → Automatically creates appropriate charts with Plotly
+
+### 💡 Tips
+
+* For "top N per state/region": Use phrases like "top 5 products **per state**"
+* The app will detect if you need window functions and suggest corrections
+* Try different groupings: per state, per region, per category, per customer
 
 ### 🔐 Security
 
@@ -312,5 +416,5 @@ st.markdown("""
 * Queries run with your user permissions
 * No data leaves your workspace
 
-**Production Ready** | LLM-Powered | Built with Streamlit + Plotly | v3.1
+**Production Ready** | LLM-Powered | Window Function Support | v4.0
 """)
