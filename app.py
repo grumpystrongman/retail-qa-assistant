@@ -3,6 +3,7 @@ import os
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import re
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
@@ -80,7 +81,6 @@ def detect_per_pattern(question):
     """Detect if question asks for top N per category"""
     q = question.lower()
     
-    # Patterns like "top N X by/per Y"
     patterns = [
         r'top \d+ .+ (by|per) (state|region|category|customer|product)',
         r'best .+ (by|per|for each) (state|region|category)',
@@ -170,8 +170,8 @@ def execute_sql(sql):
     except Exception as e:
         return None, None, f"Execution failed: {str(e)}"
 
-def create_visualization(df):
-    """Create smart visualizations based on data structure"""
+def create_visualization(df, viz_type="auto"):
+    """Create smart visualizations with multiple options"""
     
     if df.empty:
         st.info("No data to visualize")
@@ -191,67 +191,222 @@ def create_visualization(df):
             )
         return
     
-    # Two columns: category + value (simple bar chart)
+    # Two columns: category + value
     if len(df.columns) == 2 and len(numeric_cols) == 1 and len(categorical_cols) == 1:
         cat_col = categorical_cols[0]
         num_col = numeric_cols[0]
         
-        fig = px.bar(
-            df,
-            x=cat_col,
-            y=num_col,
-            title=f"{num_col.replace('_', ' ').title()} by {cat_col.replace('_', ' ').title()}",
-            color=num_col,
-            color_continuous_scale='Blues'
-        )
-        fig.update_layout(
-            xaxis_title=cat_col.replace('_', ' ').title(),
-            yaxis_title=num_col.replace('_', ' ').title(),
-            showlegend=False,
-            height=500
-        )
+        if viz_type == "bar":
+            fig = px.bar(
+                df.sort_values(num_col, ascending=False),
+                x=cat_col,
+                y=num_col,
+                title=f"{num_col.replace('_', ' ').title()} by {cat_col.replace('_', ' ').title()}",
+                color=num_col,
+                color_continuous_scale='Blues',
+                text=num_col
+            )
+            fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+            fig.update_layout(height=500, showlegend=False)
+            
+        elif viz_type == "horizontal":
+            fig = px.bar(
+                df.sort_values(num_col, ascending=True).tail(20),
+                y=cat_col,
+                x=num_col,
+                title=f"Top 20: {num_col.replace('_', ' ').title()} by {cat_col.replace('_', ' ').title()}",
+                color=num_col,
+                color_continuous_scale='Viridis',
+                text=num_col,
+                orientation='h'
+            )
+            fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+            fig.update_layout(height=600, showlegend=False)
+            
+        elif viz_type == "pie":
+            top_n = df.nlargest(10, num_col)
+            fig = px.pie(
+                top_n,
+                names=cat_col,
+                values=num_col,
+                title=f"Top 10: {num_col.replace('_', ' ').title()} Distribution"
+            )
+            fig.update_traces(textposition='inside', textinfo='percent+label')
+            fig.update_layout(height=500)
+        
+        else:  # auto
+            fig = px.bar(
+                df.sort_values(num_col, ascending=False).head(15),
+                x=cat_col,
+                y=num_col,
+                title=f"Top 15: {num_col.replace('_', ' ').title()} by {cat_col.replace('_', ' ').title()}",
+                color=num_col,
+                color_continuous_scale='Blues',
+                text=num_col
+            )
+            fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+            fig.update_layout(height=500, showlegend=False)
+        
         st.plotly_chart(fig, use_container_width=True)
         return
     
-    # Three columns: 2 categorical + 1 numeric (grouped bar chart)
+    # Three columns: 2 categorical + 1 numeric
     if len(df.columns) == 3 and len(numeric_cols) == 1 and len(categorical_cols) == 2:
         group_col = categorical_cols[0]
         category_col = categorical_cols[1]
         value_col = numeric_cols[0]
         
-        fig = px.bar(
-            df,
-            x=category_col,
-            y=value_col,
-            color=group_col,
-            title=f"{value_col.replace('_', ' ').title()} by {category_col.replace('_', ' ').title()} and {group_col.replace('_', ' ').title()}",
-            barmode='group',
-            text=value_col
-        )
-        fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
-        fig.update_layout(
-            xaxis_title=category_col.replace('_', ' ').title(),
-            yaxis_title=value_col.replace('_', ' ').title(),
-            height=500
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        return
-    
-    # Multiple numeric columns: show multiple metrics or charts
-    if len(numeric_cols) > 1 and len(categorical_cols) >= 1:
-        cat_col = categorical_cols[0]
-        
-        for num_col in numeric_cols:
+        if viz_type == "grouped_bar":
+            # Standard grouped bar chart
             fig = px.bar(
                 df,
-                x=cat_col,
-                y=num_col,
-                title=f"{num_col.replace('_', ' ').title()}",
-                color=num_col,
+                x=category_col,
+                y=value_col,
+                color=group_col,
+                title=f"{value_col.replace('_', ' ').title()} by {category_col.replace('_', ' ').title()} and {group_col.replace('_', ' ').title()}",
+                barmode='group',
+                text=value_col
+            )
+            fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+            fig.update_layout(height=600)
+            st.plotly_chart(fig, use_container_width=True)
+            
+        elif viz_type == "faceted":
+            # Small multiples - one chart per group
+            groups = sorted(df[group_col].unique())
+            n_groups = len(groups)
+            
+            # Create subplots
+            cols = 3
+            rows = (n_groups + cols - 1) // cols
+            
+            fig = make_subplots(
+                rows=rows, cols=cols,
+                subplot_titles=[f"{group_col.title()}: {g}" for g in groups],
+                vertical_spacing=0.12,
+                horizontal_spacing=0.1
+            )
+            
+            colors = px.colors.qualitative.Set2
+            
+            for idx, group in enumerate(groups):
+                row = idx // cols + 1
+                col = idx % cols + 1
+                
+                group_data = df[df[group_col] == group].sort_values(value_col, ascending=False)
+                
+                fig.add_trace(
+                    go.Bar(
+                        x=group_data[category_col],
+                        y=group_data[value_col],
+                        name=str(group),
+                        marker_color=colors[idx % len(colors)],
+                        text=group_data[value_col],
+                        texttemplate='%{text:,.0f}',
+                        textposition='outside',
+                        showlegend=False
+                    ),
+                    row=row, col=col
+                )
+            
+            fig.update_layout(
+                title_text=f"{value_col.replace('_', ' ').title()} by {category_col.replace('_', ' ').title()} (Per {group_col.replace('_', ' ').title()})",
+                height=300 * rows,
+                showlegend=False
+            )
+            
+            fig.update_xaxes(tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+            
+        elif viz_type == "heatmap":
+            # Pivot for heatmap
+            pivot = df.pivot(index=group_col, columns=category_col, values=value_col)
+            
+            fig = px.imshow(
+                pivot,
+                labels=dict(x=category_col.replace('_', ' ').title(), 
+                           y=group_col.replace('_', ' ').title(), 
+                           color=value_col.replace('_', ' ').title()),
+                title=f"{value_col.replace('_', ' ').title()} Heatmap",
+                color_continuous_scale='Blues',
+                text_auto='.0f'
+            )
+            fig.update_layout(height=600)
+            st.plotly_chart(fig, use_container_width=True)
+            
+        elif viz_type == "treemap":
+            # Hierarchical treemap
+            fig = px.treemap(
+                df,
+                path=[group_col, category_col],
+                values=value_col,
+                title=f"{value_col.replace('_', ' ').title()} Distribution",
+                color=value_col,
                 color_continuous_scale='Viridis'
             )
-            fig.update_layout(height=400)
+            fig.update_traces(textinfo="label+value+percent parent")
+            fig.update_layout(height=600)
             st.plotly_chart(fig, use_container_width=True)
+            
+        elif viz_type == "sunburst":
+            # Sunburst chart
+            fig = px.sunburst(
+                df,
+                path=[group_col, category_col],
+                values=value_col,
+                title=f"{value_col.replace('_', ' ').title()} Hierarchy",
+                color=value_col,
+                color_continuous_scale='RdYlGn'
+            )
+            fig.update_layout(height=600)
+            st.plotly_chart(fig, use_container_width=True)
+            
+        else:  # auto - use faceted for better readability
+            # Default to faceted view for multi-dimensional data
+            groups = sorted(df[group_col].unique())
+            n_groups = min(len(groups), 12)  # Limit to 12
+            groups = groups[:n_groups]
+            
+            cols = 3
+            rows = (n_groups + cols - 1) // cols
+            
+            fig = make_subplots(
+                rows=rows, cols=cols,
+                subplot_titles=[f"{g}" for g in groups],
+                vertical_spacing=0.15,
+                horizontal_spacing=0.1
+            )
+            
+            colors = px.colors.qualitative.Set2
+            
+            for idx, group in enumerate(groups):
+                row = idx // cols + 1
+                col = idx % cols + 1
+                
+                group_data = df[df[group_col] == group].sort_values(value_col, ascending=False)
+                
+                fig.add_trace(
+                    go.Bar(
+                        x=group_data[category_col],
+                        y=group_data[value_col],
+                        marker_color=colors[idx % len(colors)],
+                        text=group_data[value_col],
+                        texttemplate='%{text:,.0f}',
+                        textposition='outside',
+                        showlegend=False
+                    ),
+                    row=row, col=col
+                )
+            
+            fig.update_layout(
+                title_text=f"{value_col.replace('_', ' ').title()} per {group_col.replace('_', ' ').title()}",
+                height=300 * rows,
+                showlegend=False
+            )
+            
+            fig.update_xaxes(tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+        
         return
     
     # Default: show data table
@@ -336,7 +491,6 @@ if question:
                     if not is_valid_sql:
                         st.warning(warning)
                         if st.button("🔄 Regenerate with window function hint"):
-                            # Add explicit hint to prompt
                             hint_prompt = f"""
 {SCHEMA_CONTEXT}
 
@@ -364,6 +518,7 @@ Generate SQL query:"""
                             
                             st.code(sql, language="sql")
                             st.success("✅ Regenerated with window function pattern!")
+                            st.rerun()
                 
                 # Execute
                 with st.spinner("⚡ Executing query..."):
@@ -388,7 +543,58 @@ Generate SQL query:"""
                     tab1, tab2 = st.tabs(["📊 Visualization", "📋 Data Table"])
                     
                     with tab1:
-                        create_visualization(df)
+                        # Visualization type selector for multi-dimensional data
+                        numeric_cols = df.select_dtypes(include=['int64', 'float64', 'int32', 'float32']).columns.tolist()
+                        categorical_cols = df.select_dtypes(include=['object', 'string']).columns.tolist()
+                        
+                        if len(df.columns) == 3 and len(numeric_cols) == 1 and len(categorical_cols) == 2:
+                            st.markdown("### 🎨 Choose Visualization Type")
+                            
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                if st.button("📊 Faceted (Recommended)", use_container_width=True):
+                                    st.session_state.viz_type = "faceted"
+                                if st.button("🟦 Heatmap", use_container_width=True):
+                                    st.session_state.viz_type = "heatmap"
+                            
+                            with col2:
+                                if st.button("📈 Grouped Bars", use_container_width=True):
+                                    st.session_state.viz_type = "grouped_bar"
+                                if st.button("🌳 Treemap", use_container_width=True):
+                                    st.session_state.viz_type = "treemap"
+                            
+                            with col3:
+                                if st.button("🌅 Sunburst", use_container_width=True):
+                                    st.session_state.viz_type = "sunburst"
+                            
+                            # Get current viz type
+                            viz_type = st.session_state.get('viz_type', 'auto')
+                            
+                            st.markdown("---")
+                            create_visualization(df, viz_type)
+                            
+                        elif len(df.columns) == 2 and len(numeric_cols) == 1 and len(categorical_cols) == 1:
+                            st.markdown("### 🎨 Choose Visualization Type")
+                            
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                if st.button("📊 Bar Chart", use_container_width=True):
+                                    st.session_state.viz_type = "bar"
+                            with col2:
+                                if st.button("↔️ Horizontal Bars", use_container_width=True):
+                                    st.session_state.viz_type = "horizontal"
+                            with col3:
+                                if st.button("🥧 Pie Chart", use_container_width=True):
+                                    st.session_state.viz_type = "pie"
+                            
+                            viz_type = st.session_state.get('viz_type', 'auto')
+                            
+                            st.markdown("---")
+                            create_visualization(df, viz_type)
+                        else:
+                            create_visualization(df)
                     
                     with tab2:
                         st.dataframe(df, use_container_width=True)
@@ -402,13 +608,15 @@ st.markdown("""
 2. **SQL Generation** → Llama 3.3 70B converts natural language to SQL with window function support
 3. **Smart Detection** → Detects "per X" patterns and validates SQL correctness
 4. **Query Execution** → Runs against Unity Catalog serverless SQL
-5. **Smart Visualization** → Automatically creates appropriate charts with Plotly
+5. **Multiple Visualizations** → Choose from 5+ chart types for your data
 
-### 💡 Tips
+### 🎨 Visualization Options
 
-* For "top N per state/region": Use phrases like "top 5 products **per state**"
-* The app will detect if you need window functions and suggest corrections
-* Try different groupings: per state, per region, per category, per customer
+* **Faceted (Small Multiples)** → Best for "per state/region" queries - one chart per category
+* **Heatmap** → Great for comparing values across two dimensions
+* **Grouped Bars** → Traditional side-by-side comparison
+* **Treemap** → Hierarchical proportional view
+* **Sunburst** → Interactive radial hierarchy
 
 ### 🔐 Security
 
@@ -416,5 +624,5 @@ st.markdown("""
 * Queries run with your user permissions
 * No data leaves your workspace
 
-**Production Ready** | LLM-Powered | Window Function Support | v4.0
+**Production Ready** | LLM-Powered | Multiple Viz Options | v5.0
 """)
