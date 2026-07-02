@@ -1,6 +1,6 @@
 import streamlit as st
 import os
-import re
+import json
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementState
 
@@ -49,14 +49,14 @@ You have access to these tables in databricks_simulated_retail_customer_data.v01
    - order_datetime (timestamp)
    - number_of_line_items (bigint)
 
-Generate ONLY the SQL query, no explanation. Use fully qualified table names.
+Generate ONLY the SQL query, no explanation. Use fully qualified table names like databricks_simulated_retail_customer_data.v01.sales
 """
 
 def validate_question(question):
     """Quick domain validation"""
     q = question.lower()
     retail_kw = ['sales', 'customer', 'product', 'order', 'revenue', 'region', 
-                 'price', 'purchase', 'category', 'state', 'loyalty']
+                 'price', 'purchase', 'category', 'state', 'loyalty', 'top', 'best']
     bad_kw = ['weather', 'poem', 'story', 'news', 'recipe', 'movie']
     
     if any(word in q for word in bad_kw):
@@ -66,7 +66,7 @@ def validate_question(question):
     return False, "Please ask about sales, customers, products, or orders"
 
 def generate_sql(question):
-    """Generate SQL using LLM"""
+    """Generate SQL using LLM - FIXED to handle response correctly"""
     try:
         w = get_databricks_client()
         
@@ -76,6 +76,7 @@ User question: {question}
 
 Generate SQL query:"""
         
+        # Call the Foundation Model API
         response = w.serving_endpoints.query(
             name="databricks-meta-llama-3-3-70b-instruct",
             messages=[{"role": "user", "content": prompt}],
@@ -83,7 +84,13 @@ Generate SQL query:"""
             max_tokens=500
         )
         
-        sql = response.choices[0].message.content.strip()
+        # FIX: Handle response correctly
+        # The response object has a 'choices' attribute, not a dict
+        if hasattr(response, 'choices') and len(response.choices) > 0:
+            sql = response.choices[0].message.content.strip()
+        else:
+            # Fallback: try to access as dict
+            sql = response['choices'][0]['message']['content'].strip()
         
         # Extract SQL from markdown code blocks if present
         if "```sql" in sql:
@@ -107,7 +114,7 @@ def execute_sql(sql):
         statement = w.statement_execution.execute_statement(
             warehouse_id=os.environ.get("DATABRICKS_WAREHOUSE_ID"),
             statement=sql,
-            wait_timeout="30s"
+            wait_timeout="50s"
         )
         
         if statement.status.state != StatementState.SUCCEEDED:
@@ -153,6 +160,7 @@ if not os.environ.get("DATABRICKS_HOST") or not os.environ.get("DATABRICKS_TOKEN
     demo_mode = True
 else:
     demo_mode = False
+    st.success("✅ Connected to Databricks")
 
 # Example questions
 with st.expander("📝 Example Questions", expanded=False):
@@ -210,15 +218,18 @@ if question:
             
             if error:
                 st.error(f"❌ {error}")
+                st.info("💡 **Tip**: Try rephrasing your question or use simpler terms.")
             else:
+                st.subheader("Generated SQL:")
                 st.code(sql, language="sql")
                 
                 # Step 3: Execute SQL
-                with st.spinner("⚡ Executing query..."):
+                with st.spinner("⚡ Executing query (may take 1-2 min if warehouse is starting)..."):
                     columns, rows, error = execute_sql(sql)
                 
                 if error:
                     st.error(f"❌ {error}")
+                    st.info("The warehouse may be starting up. Wait 1-2 minutes and try again.")
                 else:
                     # Step 4: Display results
                     st.success(f"✅ Query returned {len(rows)} rows")
@@ -232,14 +243,23 @@ if question:
                     
                     with tab1:
                         # Auto-detect chart type based on columns
-                        if len(columns) == 2:
+                        if len(columns) == 2 and len(rows) > 0:
                             # Bar chart for 2 columns
-                            st.bar_chart(df.set_index(columns[0]))
-                        elif len(columns) >= 3:
-                            # Line chart or bar chart
-                            st.line_chart(df.set_index(columns[0]))
-                        else:
+                            try:
+                                st.bar_chart(df.set_index(columns[0]))
+                            except:
+                                st.dataframe(df)
+                        elif len(columns) >= 3 and len(rows) > 0:
+                            # Try line chart
+                            try:
+                                st.line_chart(df.set_index(columns[0]))
+                            except:
+                                st.dataframe(df)
+                        elif len(rows) == 1:
+                            # Single value - show as metric
                             st.metric(columns[0], df[columns[0]][0])
+                        else:
+                            st.dataframe(df, use_container_width=True)
                     
                     with tab2:
                         st.dataframe(df, use_container_width=True)
